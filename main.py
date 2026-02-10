@@ -233,11 +233,7 @@ def _assistant_message_count(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         m for m in history if isinstance(m, dict) and m.get("role") == "assistant"
     ]
     last = assistant_msgs[-1] if assistant_msgs else {}
-    final_token = {
-        "prompt_tokens": last.get("prompt_tokens") if isinstance(last.get("prompt_tokens"), int) else None,
-        "completion_tokens": last.get("completion_tokens") if isinstance(last.get("completion_tokens"), int) else None,
-        "total_tokens": last.get("total_tokens") if isinstance(last.get("total_tokens"), int) else None,
-    }
+    final_token = last.get("usage")
     return {"count": len(assistant_msgs), "final_token": final_token}
 
 
@@ -339,6 +335,7 @@ def _run_single_prompt(
 
     final_answer = ""
     seen_upto = 0
+    usage_updates: List[Tuple[Dict[str, Any], Dict[str, int]]] = []
 
     for step in range(max_steps):
         tool_choice: Any = "auto"
@@ -382,15 +379,7 @@ def _run_single_prompt(
             assistant_msg["reasoning_content"] = message.get("reasoning_content")
         usage = resp.get("usage") if isinstance(resp, dict) else None
         if isinstance(usage, dict):
-            pt = usage.get("prompt_tokens")
-            ct = usage.get("completion_tokens")
-            tt = usage.get("total_tokens")
-            if isinstance(pt, int):
-                assistant_msg["prompt_tokens"] = pt
-            if isinstance(ct, int):
-                assistant_msg["completion_tokens"] = ct
-            if isinstance(tt, int):
-                assistant_msg["total_tokens"] = tt
+            usage_updates.append((assistant_msg, usage))
         history.append(assistant_msg)
 
         tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
@@ -467,6 +456,9 @@ def _run_single_prompt(
 
         if final_answer:
             break
+
+    for msg, u in usage_updates:
+        msg["usage"] = u
 
     return history, final_answer
 
