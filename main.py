@@ -20,7 +20,6 @@ import yaml
 from openai import OpenAI
 
 from evaluator import run_evaluation
-from memory_compress import _apply_seen_tool_text_reduction
 from prompts import build_default_system_prompt
 from tools import TOOL_FN_MAP, tool_specs
 from utils import json_dumps, json_dumps_pretty, load_jsonl_records, progress_line
@@ -259,7 +258,6 @@ def _run_single_prompt(
     extra_body = model_cfg.get("extra_body")
 
     final_answer = ""
-    seen_upto = 0
     usage_updates: List[Tuple[Dict[str, Any], Dict[str, int]]] = []
 
     for step in range(max_steps):
@@ -273,23 +271,16 @@ def _run_single_prompt(
             )
             tool_choice = "none"
 
-        call_start_len = len(history)
-        messages_for_call = _apply_seen_tool_text_reduction(
-            history,
-            seen_upto=seen_upto,
-            tool_name="web_content",
-        )
         resp = _call_llm_with_retries(
             client=client,
             model=model_cfg["name"],
-            messages=messages_for_call,
+            messages=history,
             tools=tools,
             temperature=temperature,
             max_tokens=max_tokens,
             extra_body=extra_body,
             tool_choice=tool_choice,
         )
-        seen_upto = max(seen_upto, call_start_len)
 
         choice = (resp.get("choices") or [{}])[0]
         finish_reason = choice.get("finish_reason")
@@ -396,7 +387,7 @@ def main() -> None:
     parser.add_argument("--save-to", default=None)
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--llm-workers", type=int, default=30)
-    parser.add_argument("--evaluator", required=False, default=None)
+    parser.add_argument("--evaluator", required=False, default="kimi-k2.5")
     parser.add_argument("--response-file", default=None)
     args = parser.parse_args()
 

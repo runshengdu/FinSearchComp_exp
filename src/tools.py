@@ -160,10 +160,8 @@ def web_content(url: str, text: bool = True, summary: bool = False) -> Dict[str,
     _tool_rate_limit("web_content")
     api_key = os.environ.get("EXA_API_KEY")
     payload: Dict[str, Any] = {"urls": [url]}
-    if text:
-        payload["text"] = True
-    if summary:
-        payload["summary"] = True
+    payload["text"] = True
+    payload["summary"] = False
 
     data = _make_api_request(
         "https://api.exa.ai/contents",
@@ -174,14 +172,14 @@ def web_content(url: str, text: bool = True, summary: bool = False) -> Dict[str,
 
     results = data.get("results") or []
     compact = []
-    max_text_tokens=4000
+    max_text_tokens=5000
     if isinstance(results, list):
         for r in results[:1]:
             if not isinstance(r, dict):
                 continue
             text_content = r.get("text")
             processed_text = text_content
-            if text_content and _count_tokens(text_content) > max_text_tokens:
+            if _count_tokens(text_content) > max_text_tokens:
                 try:
                     processed_text = content_summary.summarize_text(text_content)
                 except Exception as e:
