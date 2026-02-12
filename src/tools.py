@@ -161,7 +161,7 @@ def web_content(url: str, text: bool = True, summary: bool = False) -> Dict[str,
     api_key = os.environ.get("EXA_API_KEY")
     payload: Dict[str, Any] = {"urls": [url]}
     payload["text"] = True
-    payload["summary"] = False
+    payload["summary"] = True
 
     data = _make_api_request(
         "https://api.exa.ai/contents",
