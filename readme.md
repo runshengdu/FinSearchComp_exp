@@ -4,16 +4,16 @@ Run FinSearchComp tasks end-to-end with an LLM + lightweight web tools, save res
 
 ## Repository Layout
 
-- [main.py](file:///c:/Users/Administrator/finsearchcomp_exp/main.py): CLI entrypoint for generation and evaluation.
-- [dataset/finsearchcomp_data.json](file:///c:/Users/Administrator/finsearchcomp_exp/dataset/finsearchcomp_data.json): Task dataset (each item has `prompt_id`, `label`, `prompt`, and judge templates).
-- [src/tools.py](file:///c:/Users/Administrator/finsearchcomp_exp/src/tools.py): Tool implementations and tool specs (`web_search_chinese`, `web_search_global`, `web_content`).
-- [src/llm.py](file:///c:/Users/Administrator/finsearchcomp_exp/src/llm.py): OpenAI-compatible chat call wrapper + retries.
-- [src/memory_compress.py](file:///c:/Users/Administrator/finsearchcomp_exp/src/memory_compress.py): 3-layer memory compression for tool-heavy runs.
-- [src/web_summary.py](file:///c:/Users/Administrator/finsearchcomp_exp/src/web_summary.py): LLM-based web text summarizer used by compression.
-- [src/evaluator.py](file:///c:/Users/Administrator/finsearchcomp_exp/src/evaluator.py): Scoring pipeline for saved responses.
-- [models.yaml](file:///c:/Users/Administrator/finsearchcomp_exp/models.yaml): Generation model configs (API key via env vars).
-- [evaluators.yaml](file:///c:/Users/Administrator/finsearchcomp_exp/evaluators.yaml): Evaluator model configs.
-- [src/llm_context_window.json](file:///c:/Users/Administrator/finsearchcomp_exp/src/llm_context_window.json): Context window per model ID.
+- [main.py](main.py): CLI entrypoint for generation and evaluation.
+- [dataset/finsearchcomp_data.json](dataset/finsearchcomp_data.json): Task dataset (each item has `prompt_id`, `label`, `prompt`, and judge templates).
+- [src/tools.py](src/tools.py): Tool implementations and tool specs (`web_search_chinese`, `web_search_global`, `web_content`).
+- [src/llm.py](src/llm.py): OpenAI-compatible chat call wrapper + retries.
+- [src/memory_compress.py](src/memory_compress.py): 3-layer memory compression for tool-heavy runs.
+- [src/web_summary.py](src/web_summary.py): LLM-based web text summarizer used by compression.
+- [src/evaluator.py](src/evaluator.py): Scoring pipeline for saved responses.
+- [models.yaml](models.yaml): Generation model configs (API key via env vars).
+- [evaluators.yaml](evaluators.yaml): Evaluator model configs.
+- [src/llm_context_window.json](src/llm_context_window.json): Context window per model ID.
 
 ## Setup
 
@@ -124,18 +124,18 @@ Tools are available to the generation model via OpenAI tool calls:
 - `web_search_global(query)`: web search (non-Chinese queries)
 - `web_content(url)`: fetch a page’s extracted text (and optional summary, depending on provider)
 
-See [src/tools.py](file:///c:/Users/Administrator/finsearchcomp_exp/src/tools.py) for provider endpoints and response shapes.
+See [src/tools.py](src/tools.py) for provider endpoints and response shapes.
 
 ## Memory Compression (3 layers)
 
 Tool-heavy runs can exceed the model context window. This project uses three layers of compression:
 
 1. **Before each LLM call**: replace older tool result messages with a short placeholder  
-   - [remove_tool_call_results_from_messages](file:///c:/Users/Administrator/finsearchcomp_exp/src/memory_compress.py#L76-L120)
+   - `remove_tool_call_results_from_messages` in [src/memory_compress.py](src/memory_compress.py)
 2. **Before each LLM call**: summarize large `web_content` tool results kept in the outgoing messages  
-   - [compress_web_content](file:///c:/Users/Administrator/finsearchcomp_exp/src/memory_compress.py#L123-L223)
+   - `compress_web_content` in [src/memory_compress.py](src/memory_compress.py)
 3. **After `web_content` returns (before saving into history)**: optionally summarize the tool result based on context window pressure  
-   - [apply_web_summary](file:///c:/Users/Administrator/finsearchcomp_exp/src/memory_compress.py#L226-L265)
+   - `apply_web_summary` in [src/memory_compress.py](src/memory_compress.py)
 
-The summarizer is implemented in [src/web_summary.py](file:///c:/Users/Administrator/finsearchcomp_exp/src/web_summary.py) and uses the `DASHSCOPE_API_KEY`.
+The summarizer is implemented in [src/web_summary.py](src/web_summary.py) and uses the `DASHSCOPE_API_KEY`.
 
