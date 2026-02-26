@@ -1,10 +1,8 @@
 import json
 import time
-import sys
-import threading
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Optional, Union
+from typing import Any, Dict, List, Sequence
 
 def json_dumps(obj: Any) -> str:
     """Compact JSON serialization."""

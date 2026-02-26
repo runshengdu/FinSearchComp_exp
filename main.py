@@ -1,9 +1,7 @@
 import argparse
-import copy
 import datetime as _dt
 import json
 import os
-import random
 import re
 import sys
 import threading
@@ -20,10 +18,45 @@ import yaml
 from openai import OpenAI
 
 from evaluator import run_evaluation
-from memory_compress import _apply_seen_tool_text_reduction
+from llm import _call_llm_with_retries
+from memory_compress import (
+    apply_web_summary,
+    compress_web_content,
+    remove_tool_call_results_from_messages,
+    _last_assistant_total_tokens,
+)
 from prompts import build_default_system_prompt
 from tools import TOOL_FN_MAP, tool_specs
 from utils import json_dumps, json_dumps_pretty, load_jsonl_records, progress_line
+
+
+def _parse_tool_args(raw_args: Any) -> Dict[str, Any]:
+    if not isinstance(raw_args, str) or not raw_args.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_args)
+    except Exception:
+        return {"_raw": raw_args}
+    return parsed if isinstance(parsed, dict) else {"_raw": raw_args}
+
+
+def _extract_tool_call(tc: Any) -> Optional[Tuple[Any, Any, Dict[str, Any]]]:
+    if not isinstance(tc, dict):
+        return None
+    tc_id = tc.get("id")
+    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+    fn_name = fn.get("name")
+    raw_args = fn.get("arguments")
+    return tc_id, fn_name, _parse_tool_args(raw_args)
+
+
+def _invoke_tool(fn_name: Any, args: Dict[str, Any]) -> Any:
+    if fn_name in TOOL_FN_MAP:
+        try:
+            return TOOL_FN_MAP[fn_name](**args)
+        except Exception as e:
+            return {"error": str(e), "tool": fn_name, "args": args}
+    return {"error": f"unknown tool: {fn_name}", "args": args}
 
 
 def _expand_history_for_save(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -80,68 +113,22 @@ def _model_config_for_save(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _add_prompt_caching(messages: List[Dict[str, Any]], model_name: str) -> List[Dict[str, Any]]:
-    if not ("minimax" in model_name.lower() or "claude" in model_name.lower()):
-        return messages
-
-    cached_messages = copy.deepcopy(messages)
-
-    for n in range(len(cached_messages)):
-        if n < len(cached_messages) - 3:
+def _load_llm_context_window_map(path: Path) -> Dict[str, int]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for k, v in data.items():
+        if not isinstance(k, str):
             continue
-        msg = cached_messages[n]
-        if not isinstance(msg, dict):
+        if isinstance(v, bool):
             continue
-        content = msg.get("content")
-
-        if isinstance(content, str):
-            msg["content"] = [
-                {
-                    "type": "text",
-                    "text": content,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ]
-            continue
-
-        if isinstance(content, list):
-            for content_item in content:
-                if isinstance(content_item, dict) and "type" in content_item:
-                    content_item["cache_control"] = {"type": "ephemeral"}
-
-    return cached_messages
-
-
-def _call_llm_with_retries(
-    client: OpenAI,
-    model: str,
-    messages: List[Dict[str, Any]],
-    tools: List[Dict[str, Any]],
-    temperature: Optional[float],
-    max_tokens: Optional[int],
-    extra_body: Optional[Dict[str, Any]],
-    tool_choice: Optional[Any],
-) -> Dict[str, Any]:
-    last_err: Optional[BaseException] = None
-    for attempt in range(1, 4):
-        try:
-            cached_messages = _add_prompt_caching(messages, model)
-            resp = client.chat.completions.create(
-                model=model,
-                messages=cached_messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                extra_body=extra_body,
-            )
-            return resp.model_dump()
-        except BaseException as e:
-            last_err = e
-            if attempt >= 3:
-                raise
-            time.sleep(0.8 * (2 ** (attempt - 1)) + random.random() * 0.2)
-    raise last_err or RuntimeError("LLM 调用失败")
+        if isinstance(v, (int, float)) and v > 0:
+            out[k] = int(v)
+    return out
 
 
 def _ensure_parent_dir(path: Path) -> None:
@@ -153,6 +140,20 @@ def _default_output_path(model_id: str, timestamp: str) -> Path:
 
 
 def _parse_sub_tasks(values: Optional[Union[str, Sequence[str]]]) -> Optional[List[str]]:
+    if not values:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    out: List[str] = []
+    for v in values:
+        parts = [p.strip() for p in v.split(",")] if "," in v else [v.strip()]
+        for p in parts:
+            if p:
+                out.append(p)
+    return out or None
+
+
+def _parse_task_ids(values: Optional[Union[str, Sequence[str]]]) -> Optional[List[str]]:
     if not values:
         return None
     if isinstance(values, str):
@@ -245,9 +246,12 @@ def _run_single_prompt(
     prompt: str,
     max_steps: int,
     tool_executor: Optional[ThreadPoolExecutor],
+    context_window: Optional[int],
     language: str = "en",
 ) -> Tuple[List[Dict[str, Any]], str]:
-    system_prompt = build_default_system_prompt(prompt, language=language)
+    if not isinstance(context_window, int) or context_window <= 0:
+        raise RuntimeError(f"context_window 未设置或非法: {context_window!r}")
+    system_prompt = build_default_system_prompt(language=language)
 
     history: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -260,7 +264,7 @@ def _run_single_prompt(
 
     final_answer = ""
     seen_upto = 0
-    usage_updates: List[Tuple[Dict[str, Any], Dict[str, int]]] = []
+    compress_enabled = False
 
     for step in range(max_steps):
         tool_choice: Any = "auto"
@@ -274,11 +278,13 @@ def _run_single_prompt(
             tool_choice = "none"
 
         call_start_len = len(history)
-        messages_for_call = _apply_seen_tool_text_reduction(
+        messages_for_call, compress_enabled = remove_tool_call_results_from_messages(
             history,
             seen_upto=seen_upto,
-            tool_name="web_content",
+            context_window=context_window,
+            enabled=compress_enabled,
         )
+        messages_for_call, _ = compress_web_content(messages_for_call)
         resp = _call_llm_with_retries(
             client=client,
             model=model_cfg["name"],
@@ -304,65 +310,44 @@ def _run_single_prompt(
             assistant_msg["reasoning_content"] = message.get("reasoning_content")
         usage = resp.get("usage") if isinstance(resp, dict) else None
         if isinstance(usage, dict):
-            usage_updates.append((assistant_msg, usage))
+            assistant_msg["usage"] = usage
         history.append(assistant_msg)
 
         tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
         if tool_calls and isinstance(tool_calls, list) and tool_choice != "none":
-            def _invoke_tool(fn_name: Any, args: Dict[str, Any]) -> Any:
-                if fn_name in TOOL_FN_MAP:
-                    try:
-                        return TOOL_FN_MAP[fn_name](**args)
-                    except Exception as e:
-                        return {"error": str(e), "tool": fn_name, "args": args}
-                return {"error": f"unknown tool: {fn_name}", "args": args}
+            parsed_calls: List[Tuple[Any, Any, Dict[str, Any]]] = []
+            tool_name_by_id: Dict[Any, Any] = {}
+            for tc in tool_calls:
+                extracted = _extract_tool_call(tc)
+                if extracted is None:
+                    continue
+                tc_id, fn_name, args = extracted
+                tool_name_by_id[tc_id] = fn_name
+                parsed_calls.append((tc_id, fn_name, args))
 
             results_by_id: Dict[Any, Any] = {}
-            futures = []
-            if tool_executor is not None and len(tool_calls) > 1:
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    tc_id = tc.get("id")
-                    fn = (tc.get("function") or {}) if isinstance(tc.get("function"), dict) else {}
-                    fn_name = fn.get("name")
-                    raw_args = fn.get("arguments")
-
-                    args: Dict[str, Any] = {}
-                    if isinstance(raw_args, str) and raw_args.strip():
-                        try:
-                            args = json.loads(raw_args)
-                        except Exception:
-                            args = {"_raw": raw_args}
-
-                    futures.append((tc_id, tool_executor.submit(_invoke_tool, fn_name, args)))
-
+            if tool_executor is not None and len(parsed_calls) > 1:
+                futures = [(tc_id, tool_executor.submit(_invoke_tool, fn_name, args)) for tc_id, fn_name, args in parsed_calls]
                 for tc_id, fut in futures:
                     try:
                         results_by_id[tc_id] = fut.result()
                     except Exception as e:
                         results_by_id[tc_id] = {"error": str(e), "tool_call_id": tc_id}
             else:
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    tc_id = tc.get("id")
-                    fn = (tc.get("function") or {}) if isinstance(tc.get("function"), dict) else {}
-                    fn_name = fn.get("name")
-                    raw_args = fn.get("arguments")
-
-                    args: Dict[str, Any] = {}
-                    if isinstance(raw_args, str) and raw_args.strip():
-                        try:
-                            args = json.loads(raw_args)
-                        except Exception:
-                            args = {"_raw": raw_args}
+                for tc_id, fn_name, args in parsed_calls:
                     results_by_id[tc_id] = _invoke_tool(fn_name, args)
 
+            last_total = _last_assistant_total_tokens(history)
             for tc in tool_calls:
                 if not isinstance(tc, dict):
                     continue
                 tc_id = tc.get("id")
+                if tool_name_by_id.get(tc_id) == "web_content":
+                    results_by_id[tc_id] = apply_web_summary(
+                        results_by_id.get(tc_id),
+                        context_window=context_window,
+                        last_assistant_total_tokens=last_total,
+                    )
                 history.append(
                     {
                         "role": "tool",
@@ -382,9 +367,6 @@ def _run_single_prompt(
         if final_answer:
             break
 
-    for msg, u in usage_updates:
-        msg["usage"] = u
-
     return history, final_answer
 
 
@@ -392,11 +374,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", required=False, default="deepseek-reasoner")
     parser.add_argument("--sub-tasks", type=str, default="Complex_Historical_Investigation(Greater China)")
-    parser.add_argument("--num-tasks", type=int, default=None)
+    parser.add_argument("--task-ids", type=str, default=None)
     parser.add_argument("--save-to", default=None)
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--llm-workers", type=int, default=30)
-    parser.add_argument("--evaluator", required=False, default="kimi-k2.5")
+    parser.add_argument("--evaluator", required=False, default=None)
     parser.add_argument("--response-file", default=None)
     args = parser.parse_args()
 
@@ -412,10 +394,12 @@ def main() -> None:
         if isinstance(pid, str):
             dataset_by_id[pid] = d
 
-    eval_mode = bool(args.evaluator) or bool(args.response_file)
+    eval_mode = bool(args.response_file)
+    if args.evaluator and not args.response_file:
+        raise RuntimeError("使用 --evaluator 时必须同时提供 --response-file")
     if eval_mode:
-        if not args.evaluator or not args.response_file:
-            raise RuntimeError("评估模式需要同时提供 --evaluator 和 --response-file")
+        if not args.evaluator:
+            args.evaluator = "deepseek-chat"
         response_path = Path(args.response_file)
         if not response_path.exists():
             raise RuntimeError(f"response-file 不存在: {response_path}")
@@ -440,10 +424,22 @@ def main() -> None:
         raise RuntimeError("生成模式需要提供 --model-id")
 
     model_cfg = _load_model_config(models_yaml_path, args.model_id)
+    llm_context_window_path = root / "src" / "llm_context_window.json"
+    llm_context_windows = _load_llm_context_window_map(llm_context_window_path)
+    context_window = llm_context_windows.get(str(args.model_id))
+    if not isinstance(context_window, int) or context_window <= 0:
+        raise RuntimeError(
+            f"llm_context_window.json 缺少有效配置: model-id={args.model_id}"
+        )
 
     sub_tasks = _parse_sub_tasks(args.sub_tasks)
     if sub_tasks:
         dataset = [d for d in dataset if str(d.get("label", "")).strip() in set(sub_tasks)]
+
+    task_ids = _parse_task_ids(args.task_ids)
+    if task_ids:
+        allowed = set(task_ids)
+        dataset = [d for d in dataset if str(d.get("prompt_id", "")).strip() in allowed]
 
     dataset_ids = [str(d["prompt_id"]) for d in dataset if isinstance(d.get("prompt_id"), str)]
 
@@ -459,8 +455,6 @@ def main() -> None:
 
     seen = _existing_prompt_ids(save_to, dataset_ids)
     remaining = [d for d in dataset if d.get("prompt_id") not in seen]
-    if args.num_tasks is not None:
-        remaining = remaining[: max(0, int(args.num_tasks))]
 
     task_config = {"max_steps": int(args.max_steps), "sub_tasks": sub_tasks}
     model_config_for_save = {"model_id": args.model_id, **_model_config_for_save(model_cfg)}
@@ -476,9 +470,9 @@ def main() -> None:
 
     if not remaining:
         if sub_tasks and len(dataset) == 0:
-            print("没有匹配到任何数据：请检查 --sub-tasks 是否与 dataset 的 label 一致")
+            print("没有匹配到任何数据：请检查 --sub-tasks/--task-ids 是否与 dataset 匹配")
         else:
-            print("没有待运行任务：可能全部已在 save_to 中存在，或 --num-tasks=0")
+            print("没有待运行任务：可能全部已在 save_to 中存在，或过滤条件无匹配")
         return
 
     llm_workers = int(args.llm_workers)
@@ -513,6 +507,7 @@ def main() -> None:
                         prompt=prompt,
                         max_steps=int(args.max_steps),
                         tool_executor=tool_ex,
+                        context_window=context_window,
                         language=target_language,
                     )
                     if not final_answer:

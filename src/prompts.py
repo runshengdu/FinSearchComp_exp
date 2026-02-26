@@ -1,5 +1,4 @@
 import datetime as _dt
-import re
 from typing import Optional
 
 
@@ -29,14 +28,10 @@ Current date: {datetime}
 """
 
 
-def build_default_system_prompt(prompt: str, now: Optional[_dt.datetime] = None, language: str = "en") -> str:
+def build_default_system_prompt(now: Optional[_dt.datetime] = None, language: str = "en") -> str:
     dt = now or _dt.datetime.now()
     now_str = dt.strftime("%Y-%m-%d")
 
-    use_zh = False
     if language == "zh":
-        use_zh = True
-
-    if use_zh:
         return default_system_prompt_zh.format(datetime=now_str)
     return default_system_prompt_en.format(datetime=now_str)

@@ -1,15 +1,10 @@
 import os
-import asyncio
-import logging
 import threading
 import time
-from typing import Any, Dict, List
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List
 import requests
-import tiktoken
-from src import content_summary
 from utils import json_dumps
-
-logger = logging.getLogger(__name__)
 
 _TOOL_MIN_INTERVAL_SECONDS: Dict[str, float] = {
     "web_search_chinese": 0.2,
@@ -26,13 +21,18 @@ _TOOL_SEMAPHORES: Dict[str, threading.BoundedSemaphore] = {
     k: threading.BoundedSemaphore(v) for k, v in _TOOL_MAX_CONCURRENCY.items() if v and v > 0
 }
 
-def _count_tokens(text: str) -> int:
-    encoding = tiktoken.encoding_for_model("cl100k_base")
-    return len(encoding.encode(text))
 
-def _truncate_text(text:str, max_tokens:int) -> str:
-    enc=tiktoken.get_encoding("cl100k_base")
-    return enc.decode(enc.encode(text)[:max_tokens])
+@contextmanager
+def _maybe_semaphore(sem: threading.BoundedSemaphore | None) -> Iterator[None]:
+    if sem is None:
+        yield
+        return
+    sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
 
 def _tool_rate_limit(tool_name: str) -> None:
     min_interval = float(_TOOL_MIN_INTERVAL_SECONDS.get(tool_name, 0.0) or 0.0)
@@ -65,40 +65,25 @@ def _make_api_request(
     return resp.json()
 
 
-def web_search_chinese(query: str, count: int = 5) -> Dict[str, Any]:
+def web_search_chinese(query: str, count: int = 3) -> Dict[str, Any]:
     _tool_rate_limit("web_search_chinese")
     api_key = os.environ.get("GLM_API_KEY")
     sem = _TOOL_SEMAPHORES.get("web_search_chinese")
-    if sem is None:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "search_query": query,
+        "search_engine": "search_pro",
+        "count": int(count),
+        "content_size": "medium",
+        "search_intent": False,
+    }
+    with _maybe_semaphore(sem):
         data = _make_api_request(
             "https://open.bigmodel.cn/api/paas/v4/web_search",
-            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            {
-                "search_query": query,
-                "search_engine": "search_std",
-                "count": int(count),
-                "content_size": "medium",
-                "search_intent": False,
-            },
-            timeout=60
+            headers,
+            payload,
+            timeout=60,
         )
-    else:
-        sem.acquire()
-        try:
-            data = _make_api_request(
-                "https://open.bigmodel.cn/api/paas/v4/web_search",
-                {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                {
-                    "search_query": query,
-                    "search_engine": "search_std",
-                    "count": int(count),
-                    "content_size": "medium",
-                    "search_intent": False,
-                },
-                timeout=60
-            )
-        finally:
-            sem.release()
 
     results = data.get("search_result") or data.get("search_results") or []
     compact = []
@@ -118,7 +103,7 @@ def web_search_chinese(query: str, count: int = 5) -> Dict[str, Any]:
     return {"query": query, "results": compact}
 
 
-def web_search_global(query: str, max_results: int = 5) -> Dict[str, Any]:
+def web_search_global(query: str, max_results: int = 3) -> Dict[str, Any]:
     _tool_rate_limit("web_search_global")
     api_key = os.environ.get("PARALLEL_API_KEY")
     data = _make_api_request(
@@ -133,7 +118,7 @@ def web_search_global(query: str, max_results: int = 5) -> Dict[str, Any]:
             "objective": query,
             "search_queries": [query],
             "max_results": int(max_results),
-            "excerpts": {"max_chars_per_result": 1000},
+            "excerpts": {"max_chars_per_result": 500},
         },
         timeout=90
     )
@@ -160,8 +145,8 @@ def web_content(url: str, text: bool = True, summary: bool = False) -> Dict[str,
     _tool_rate_limit("web_content")
     api_key = os.environ.get("EXA_API_KEY")
     payload: Dict[str, Any] = {"urls": [url]}
-    payload["text"] = True
-    payload["summary"] = True
+    payload["text"] = bool(text)
+    payload["summary"] = bool(summary)
 
     data = _make_api_request(
         "https://api.exa.ai/contents",
@@ -172,25 +157,16 @@ def web_content(url: str, text: bool = True, summary: bool = False) -> Dict[str,
 
     results = data.get("results") or []
     compact = []
-    max_text_tokens=5000
     if isinstance(results, list):
         for r in results[:1]:
             if not isinstance(r, dict):
                 continue
-            text_content = r.get("text")
-            processed_text = text_content
-            if _count_tokens(text_content) > max_text_tokens:
-                try:
-                    processed_text = content_summary.summarize_text(text_content)
-                except Exception as e:
-                    processed_text = _truncate_text(text_content, max_text_tokens)
-                    logger.error(f"Failed to summarize text for {url}: {e}")
             compact.append(
                 {
                     "title": r.get("title"),
                     "url": r.get("url"),
                     "publishedDate": r.get("publishedDate"),
-                    "text": processed_text,
+                    "text": r.get("text"),
                     "summary": r.get("summary"),
                 }
             )
@@ -208,7 +184,6 @@ def tool_specs() -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "count": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
                     },
                     "required": ["query"],
                 },
@@ -223,7 +198,6 @@ def tool_specs() -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "max_results": {"type": "integer", "default": 10, "minimum": 1, "maximum": 20},
                     },
                     "required": ["query"],
                 },
@@ -238,8 +212,6 @@ def tool_specs() -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         "url": {"type": "string"},
-                        "text": {"type": "boolean", "default": True},
-                        "summary": {"type": "boolean", "default": False},
                     },
                     "required": ["url"],
                 },
